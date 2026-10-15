@@ -206,6 +206,10 @@ impl<'a> Checker<'a> {
                 // the other (O5.2). Primitive-element slices share nothing.
                 if name == "copy" {
                     self.record_copy_may_share(st, cr);
+                    // T22 (#238): `copy(dst, src)` writes elements into `dst` —
+                    // a `const` slice root is deeply immutable and cannot be
+                    // the destination of `copy`.
+                    self.check_copy_const(st, cr, &HashSet::new());
                 }
                 if name == "delete" {
                     // A3: map delete is a map mutation
@@ -1080,17 +1084,22 @@ impl<'a> Checker<'a> {
     /// binding must freeze the other (O5.2). A primitive-element slice
     /// (`[]int`) copies by value and shares nothing, so no edge is recorded
     /// and the positive control stays accepted.
-    fn record_copy_may_share(&self, st: &mut FnState, cr: &CallRef) {
+    pub(crate) fn record_copy_may_share(&self, st: &mut FnState, cr: &CallRef) {
         let (Some(dst), Some(src)) = (cr.args.first(), cr.args.get(1)) else {
             return;
         };
         // A slice shape is always a reference (`shape_may_share(Slice)` is
         // unconditional), so consult the ELEMENT shape instead: only a
-        // reference-bearing element is copied by reference.
-        let TypeShape::Slice(elem) = self.shape_of_expr(st, unwrap_parens(&dst.value)) else {
-            return;
-        };
-        if !self.shape_may_share(&elem) {
+        // reference-bearing element is copied by reference. Check both `dst`
+        // and `src` so an untyped/unknown slice on one side still records the
+        // edge when the other side's element type is known to share.
+        let elem_shares = [&dst.value, &src.value].into_iter().any(|arg| {
+            matches!(
+                self.shape_of_expr(st, unwrap_parens(arg)),
+                TypeShape::Slice(elem) if self.shape_may_share(&elem)
+            )
+        });
+        if !elem_shares {
             return;
         }
         let mut dst_roots = Vec::new();
@@ -1635,13 +1644,22 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            // `delete(const_map, k)` is a mutation too — the direct form is
-            // checked in process_call; a closure's own delete never gets
-            // there (#123).
+            // `delete(const_map, k)` and `copy(const_slice, src)` are mutations
+            // too — the direct forms are checked in process_call; a closure's
+            // own calls never get there (#123, #238).
             let mut calls = Vec::new();
-            walk::own_calls(stmt, &mut calls);
+            if let Stmt::For {
+                kind: hy_syntax::ForKind::Iterate { expr, .. },
+                ..
+            } = stmt
+            {
+                walk::expr_calls(expr, &mut calls);
+            } else {
+                walk::own_calls(stmt, &mut calls);
+            }
             for cr in &calls {
                 self.check_delete_const(st, cr, &here);
+                self.check_copy_const(st, cr, &here);
             }
             // nested closures — a NESTED closure's own locals shadow only at
             // its level (flatten does not descend into FnLit bodies, so each
@@ -1662,7 +1680,7 @@ impl<'a> Checker<'a> {
         let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) else {
             return;
         };
-        if name.as_str() != "delete" {
+        if name.as_str() != "delete" || declared.contains("delete") {
             return;
         }
         let Some(first) = cr.args.first() else {
@@ -1680,6 +1698,44 @@ impl<'a> Checker<'a> {
         };
         if let Some(hit) = self.const_write_root(st, &place) {
             self.emit_const_write_error(&hit, first.value.span());
+        }
+    }
+
+    /// HYB-E3006 for `copy(dst, src)` (#238): `copy` writes elements into its
+    /// destination slice `dst`, so a `const` root (or an alias / slice view /
+    /// may-share peer of a `const` root) is frozen exactly like an index write
+    /// (T22).
+    fn check_copy_const(&mut self, st: &FnState, cr: &CallRef, declared: &HashSet<String>) {
+        let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) else {
+            return;
+        };
+        if name.as_str() != "copy" || declared.contains("copy") {
+            return;
+        }
+        let Some(first) = cr.args.first() else {
+            return;
+        };
+        if matches!(
+            crate::model::unwrap_parens(&first.value),
+            Expr::Call { callee, .. }
+                if matches!(crate::model::unwrap_parens(callee), Expr::Ident { name, .. } if name == "make")
+        ) {
+            return;
+        }
+        let mut roots = Vec::new();
+        collect_ref_roots(&first.value, &mut roots);
+        for root in roots {
+            if declared.contains(&root) {
+                continue;
+            }
+            let place = Place {
+                kind: PlaceKind::Ident(root),
+                span: first.value.span(),
+            };
+            if let Some(hit) = self.const_write_root(st, &place) {
+                self.emit_const_write_error(&hit, first.value.span());
+                return;
+            }
         }
     }
 
